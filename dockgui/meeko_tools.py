@@ -27,6 +27,13 @@ class MeekoPreparedFile:
     stderr: str
 
 
+@dataclass(slots=True, frozen=True)
+class SmilesLigandRecord:
+    smiles: str
+    molecule_name: str = ""
+    row_number: int = 0
+
+
 @lru_cache(maxsize=1)
 def probe_meeko() -> tuple[bool, str]:
     try:
@@ -308,6 +315,122 @@ def prepare_ligands_pdbqt(
             )
 
         return prepared_files
+
+
+def prepare_smiles_ligands_pdbqt(
+    source_name: str,
+    records: list[SmilesLigandRecord],
+    *,
+    charge_model: str = "gasteiger",
+) -> list[MeekoPreparedFile]:
+    available, detail = probe_meeko()
+    if not available:
+        raise RuntimeError(f"Meeko is not available: {detail}")
+    if charge_model not in LIGAND_CHARGE_MODELS:
+        supported = ", ".join(sorted(LIGAND_CHARGE_MODELS))
+        raise ValueError(f"Unsupported ligand charge model: {charge_model}. Choices: {supported}")
+    if charge_model == "read":
+        raise ValueError("SMILES CSV does not include per-atom partial charges. Use 'gasteiger' or 'zero'.")
+    if not records:
+        raise ValueError("CSV file does not contain any candidate SMILES rows.")
+
+    from meeko import MoleculePreparation, PDBQTWriterLegacy
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+
+    safe_input_name = sanitize_filename(source_name)
+    output_stem = Path(safe_input_name).stem or "ligand"
+    preparator = MoleculePreparation(charge_model=charge_model)
+    fragment_chooser = rdMolStandardize.LargestFragmentChooser()
+
+    prepared_files: list[MeekoPreparedFile] = []
+    failures: list[str] = []
+    seen_names: set[str] = set()
+
+    for index, record in enumerate(records, start=1):
+        row_number = record.row_number or index
+        smiles = record.smiles.strip()
+        molecule_name = record.molecule_name.strip() or f"{output_stem}-row-{row_number}"
+        if not smiles:
+            failures.append(f"Row {row_number} ({molecule_name}): empty SMILES.")
+            continue
+
+        molecule = Chem.MolFromSmiles(smiles, sanitize=True)
+        if molecule is None:
+            failures.append(f"Row {row_number} ({molecule_name}): invalid SMILES.")
+            continue
+
+        try:
+            working_molecule = fragment_chooser.choose(Chem.Mol(molecule))
+            if working_molecule is None or working_molecule.GetNumAtoms() == 0:
+                raise RuntimeError("RDKit returned an empty molecule.")
+            working_molecule = Chem.AddHs(working_molecule)
+
+            params = AllChem.ETKDGv3()
+            params.randomSeed = 4200 + row_number
+            status = AllChem.EmbedMolecule(working_molecule, params)
+            if status != 0:
+                status = AllChem.EmbedMolecule(
+                    working_molecule,
+                    maxAttempts=1000,
+                    randomSeed=4200 + row_number,
+                    useRandomCoords=True,
+                    ignoreSmoothingFailures=True,
+                )
+            if status != 0:
+                raise RuntimeError("3D embedding failed")
+            try:
+                if AllChem.MMFFHasAllMoleculeParams(working_molecule):
+                    AllChem.MMFFOptimizeMolecule(working_molecule)
+                else:
+                    AllChem.UFFOptimizeMolecule(working_molecule)
+            except Exception:
+                pass
+
+            setups = preparator.prepare(working_molecule)
+            if not setups:
+                raise RuntimeError("Meeko did not return any ligand setup.")
+
+            for setup_index, setup in enumerate(setups, start=1):
+                pdbqt_string, success, error_message = PDBQTWriterLegacy.write_string(setup)
+                if not success or not pdbqt_string.strip():
+                    raise RuntimeError(error_message or "Failed to generate ligand PDBQT.")
+
+                prepared_files.append(
+                    MeekoPreparedFile(
+                        name=_build_ligand_name(
+                            output_stem=output_stem,
+                            molecule_name=molecule_name,
+                            index=row_number,
+                            setup_index=setup_index,
+                            total_setups=len(setups),
+                            seen_names=seen_names,
+                        ),
+                        data=pdbqt_string.encode("utf-8"),
+                        stdout=f"Prepared from CSV SMILES row {row_number} via RDKit + Meeko API.",
+                        stderr="",
+                    )
+                )
+        except Exception as exc:
+            failures.append(f"Row {row_number} ({molecule_name}): {exc}")
+
+    failure_summary = _summarize_failures(failures, prepared_count=len(prepared_files))
+    if not prepared_files:
+        raise RuntimeError(failure_summary or "Meeko did not generate any ligand PDBQT files from the CSV SMILES.")
+
+    if not failure_summary:
+        return prepared_files
+
+    return [
+        MeekoPreparedFile(
+            name=prepared_file.name,
+            data=prepared_file.data,
+            stdout=prepared_file.stdout,
+            stderr=failure_summary,
+        )
+        for prepared_file in prepared_files
+    ]
 
 
 def prepare_ligand_pdbqt(

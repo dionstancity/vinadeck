@@ -10,6 +10,8 @@
 - 输入 `PDB ID` 从 RCSB 下载结构，按链清洗受体，移除水 / 氢 / 杂原子
 - 使用 `Meeko` 直接执行 `PDB/PQR -> receptor.pdbqt`
 - 使用 `Meeko` 直接执行 `SDF/MOL2/MOL -> ligand.pdbqt`
+- 支持导入包含 `SMILES` 列的 `CSV`，直接批量生成候选配体 `PDBQT`
+- 支持导入可选配置文件，自动回填 `center_*`、`size_*`、`num_modes`、`energy_range`、`seed` 等参数
 - 选择当前配体或晶体配体自动估算 docking box
 - 为每次成功运行保存 `run.json`，支持任务历史回看
 - 使用 `3Dmol.js` 查看受体、配体和搜索盒
@@ -144,6 +146,36 @@ streamlit run app.py
   - `run.json` 任务摘要
   - GPU 模式下会额外保存 `vina-gpu.conf` 和 GPU 输出目录中的结果文件
 - `History` 标签页会读取这些 `run.json` 并允许重新查看 pose
+
+### D. 导入 `CSV(SMILES)` 候选化合物
+
+1. 在配体区域切换到 `导入 CSV(SMILES) + Meeko`
+2. 上传一个包含 `SMILES` 列的 `CSV`
+3. 选择 `SMILES` 列，以及可选的名称列
+4. 选择电荷模型（`gasteiger` 或 `zero`）
+5. 点击“用 Meeko 准备 CSV 配体”
+6. 程序会把每一行候选化合物转换为 `ligand.pdbqt`，并继续支持批量 docking、预览和下载
+
+说明：
+
+- 默认会优先识别 `smiles`、`smile`、`canonical_smiles`、`isomeric_smiles`
+- 如果没有名称列，程序会自动按 `文件名-row-N` 命名
+- 空白 `SMILES` 行会自动跳过
+
+### E. 导入可选配置文件
+
+1. 在左侧边栏点击“导入可选配置文件”
+2. 选择一个 `vina.conf`、`vina-gpu.conf` 或自定义 `key = value` 文本
+3. 点击“应用配置文件”
+4. 程序会自动回填搜索盒、CPU/GPU 数值参数，并在识别到 GPU 专属字段时自动切换后端
+
+当前支持的常用键包括：
+
+- `center_x`、`center_y`、`center_z`
+- `size_x`、`size_y`、`size_z`
+- `exhaustiveness`、`cpu`
+- `thread`、`search_depth`
+- `num_modes`、`energy_range`、`seed`
 
 ## Windows 桌面打包
 

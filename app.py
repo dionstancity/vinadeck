@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 import subprocess
 from pathlib import Path
@@ -9,7 +10,13 @@ import pandas as pd
 import streamlit as st
 
 from dockgui.history import list_history, load_run_from_manifest
-from dockgui.meeko_tools import prepare_ligands_pdbqt, prepare_receptor_pdbqt, probe_meeko
+from dockgui.meeko_tools import (
+    SmilesLigandRecord,
+    prepare_ligands_pdbqt,
+    prepare_receptor_pdbqt,
+    prepare_smiles_ligands_pdbqt,
+    probe_meeko,
+)
 from dockgui.models import DockingBackendConfig, DockingBox, DockingJob, DockingRun, PdbEntryMetadata, StructureInput
 from dockgui.parsing import pdbqt_to_pdb, structure_has_atoms, suggest_box_from_structure
 from dockgui.rcsb import clean_pdb_text, extract_residue_pdb, fetch_pdb_entry
@@ -30,6 +37,7 @@ HELPER_RECEPTOR_MODE = "PDB ID helper + Meeko"
 RAW_RECEPTOR_MODE = "上传 PDB/PQR + Meeko"
 DIRECT_LIGAND_MODE = "上传 ligand.pdbqt"
 MEEKO_LIGAND_MODE = "上传 SDF/MOL2/MOL + Meeko"
+CSV_SMILES_LIGAND_MODE = "导入 CSV(SMILES) + Meeko"
 
 CPU_BACKEND = "AutoDock Vina (CPU)"
 GPU_BACKEND = "Official Vina-GPU (本地 GPU)"
@@ -38,6 +46,39 @@ GPU_BACKEND = "Official Vina-GPU (本地 GPU)"
 def init_state() -> None:
     for key, value in DEFAULT_BOX.items():
         st.session_state.setdefault(key, value)
+    st.session_state.setdefault("backend_label", CPU_BACKEND)
+    st.session_state.setdefault("vina_executable", os.environ.get("VINA_EXE", "vina"))
+    st.session_state.setdefault(
+        "vina_gpu_executable",
+        preferred_path(
+            os.environ.get("VINA_GPU_EXE", ""),
+            r"C:\Tools\Vina-GPU\vina_gpu.exe",
+            r"C:\Tools\Vina-GPU\Vina-GPU.exe",
+            "vina_gpu.exe",
+        ),
+    )
+    st.session_state.setdefault(
+        "vina_gpu_kernel_executable",
+        preferred_path(
+            os.environ.get("VINA_GPU_K_EXE", ""),
+            r"C:\Tools\Vina-GPU\vina_gpu_k.exe",
+            r"C:\Tools\Vina-GPU\Vina-GPU-K.exe",
+            "vina_gpu_k.exe",
+        ),
+    )
+    st.session_state.setdefault("vina_gpu_thread", int(os.environ.get("VINA_GPU_THREAD", "1000")))
+    st.session_state.setdefault("vina_gpu_search_depth", os.environ.get("VINA_GPU_SEARCH_DEPTH", ""))
+    st.session_state.setdefault("runs_dir", "runs")
+    st.session_state.setdefault("cpu_exhaustiveness", 8)
+    st.session_state.setdefault("cpu_num_modes", 9)
+    st.session_state.setdefault("cpu_energy_range", 3.0)
+    st.session_state.setdefault("cpu_threads", 0)
+    st.session_state.setdefault("cpu_seed", "")
+    st.session_state.setdefault("gpu_num_modes", 9)
+    st.session_state.setdefault("gpu_energy_range", 3.0)
+    st.session_state.setdefault("gpu_seed", "")
+    st.session_state.setdefault("config_import_message", "")
+    st.session_state.setdefault("config_import_error", "")
     st.session_state.setdefault("last_run", None)
     st.session_state.setdefault("batch_runs", [])
     st.session_state.setdefault("batch_failures", [])
@@ -105,6 +146,66 @@ def stored_structure_list(key: str) -> list[StructureInput]:
     return [item for item in value if isinstance(item, StructureInput)]
 
 
+def read_uploaded_csv_table(upload) -> pd.DataFrame:
+    payload = upload.getvalue()
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            frame = pd.read_csv(
+                io.BytesIO(payload),
+                encoding=encoding,
+                sep=None,
+                engine="python",
+                dtype=str,
+                keep_default_na=False,
+            )
+            frame = frame.dropna(how="all")
+            frame.columns = [str(column).strip() for column in frame.columns]
+            return frame
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(f"无法读取 CSV 文件：{last_error}")
+
+
+def choose_preferred_column(columns: list[str], candidates: tuple[str, ...]) -> str | None:
+    normalized = {column.strip().lower(): column for column in columns}
+    for candidate in candidates:
+        if candidate in normalized:
+            return normalized[candidate]
+    return columns[0] if columns else None
+
+
+def build_smiles_records(
+    frame: pd.DataFrame,
+    *,
+    smiles_column: str,
+    name_column: str | None,
+    fallback_stem: str,
+) -> tuple[list[SmilesLigandRecord], int]:
+    records: list[SmilesLigandRecord] = []
+    skipped_empty = 0
+
+    for row_number, (_, row) in enumerate(frame.iterrows(), start=1):
+        smiles = str(row.get(smiles_column, "")).strip()
+        if not smiles:
+            skipped_empty += 1
+            continue
+        molecule_name = ""
+        if name_column:
+            molecule_name = str(row.get(name_column, "")).strip()
+        if not molecule_name:
+            molecule_name = f"{fallback_stem}-row-{row_number}"
+        records.append(
+            SmilesLigandRecord(
+                smiles=smiles,
+                molecule_name=molecule_name,
+                row_number=row_number,
+            )
+        )
+
+    return records, skipped_empty
+
+
 def parse_optional_int(value: str) -> int | None:
     stripped = value.strip()
     if not stripped:
@@ -139,6 +240,100 @@ def current_box() -> DockingBox:
     )
 
 
+def parse_optional_config_text(text: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].split(";", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        normalized_key = key.strip().lower()
+        normalized_value = value.strip()
+        if normalized_key:
+            values[normalized_key] = normalized_value
+    return values
+
+
+def apply_optional_config(values: dict[str, str]) -> list[str]:
+    applied: list[str] = []
+
+    float_fields = {
+        "center_x": "center_x",
+        "center_y": "center_y",
+        "center_z": "center_z",
+        "size_x": "size_x",
+        "size_y": "size_y",
+        "size_z": "size_z",
+    }
+    int_fields = {
+        "exhaustiveness": "cpu_exhaustiveness",
+        "cpu": "cpu_threads",
+        "thread": "vina_gpu_thread",
+    }
+    shared_float_fields = {
+        "energy_range": ("cpu_energy_range", "gpu_energy_range"),
+    }
+    shared_int_fields = {
+        "num_modes": ("cpu_num_modes", "gpu_num_modes"),
+    }
+    shared_text_fields = {
+        "seed": ("cpu_seed", "gpu_seed"),
+    }
+    text_fields = {
+        "search_depth": "vina_gpu_search_depth",
+    }
+
+    for config_key, state_key in float_fields.items():
+        if config_key not in values:
+            continue
+        st.session_state[state_key] = float(values[config_key])
+        applied.append(config_key)
+
+    for config_key, state_key in int_fields.items():
+        if config_key not in values:
+            continue
+        st.session_state[state_key] = int(float(values[config_key]))
+        applied.append(config_key)
+
+    for config_key, state_keys in shared_float_fields.items():
+        if config_key not in values:
+            continue
+        parsed = float(values[config_key])
+        for state_key in state_keys:
+            st.session_state[state_key] = parsed
+        applied.append(config_key)
+
+    for config_key, state_keys in shared_int_fields.items():
+        if config_key not in values:
+            continue
+        parsed = int(float(values[config_key]))
+        for state_key in state_keys:
+            st.session_state[state_key] = parsed
+        applied.append(config_key)
+
+    for config_key, state_keys in shared_text_fields.items():
+        if config_key not in values:
+            continue
+        for state_key in state_keys:
+            st.session_state[state_key] = values[config_key]
+        applied.append(config_key)
+
+    for config_key, state_key in text_fields.items():
+        if config_key not in values:
+            continue
+        st.session_state[state_key] = values[config_key]
+        applied.append(config_key)
+
+    gpu_markers = {"thread", "search_depth", "ligand_directory", "output_directory", "opencl_binary_path", "rilc_bfgs"}
+    cpu_markers = {"exhaustiveness", "cpu"}
+    if any(marker in values for marker in gpu_markers):
+        st.session_state["backend_label"] = GPU_BACKEND
+    elif any(marker in values for marker in cpu_markers):
+        st.session_state["backend_label"] = CPU_BACKEND
+
+    return applied
+
+
 def box_valid(box: DockingBox) -> bool:
     return all(value > 0 for value in (box.size_x, box.size_y, box.size_z))
 
@@ -147,7 +342,7 @@ def format_chain_label(chain_id: str) -> str:
     return chain_id or "(blank)"
 
 
-def show_environment_panel() -> tuple[DockingBackendConfig, Path, bool]:
+def _legacy_show_environment_panel() -> tuple[DockingBackendConfig, Path, bool]:
     meeko_available, meeko_detail = probe_meeko()
     with st.sidebar:
         st.header("运行环境")
@@ -240,7 +435,7 @@ def show_environment_panel() -> tuple[DockingBackendConfig, Path, bool]:
         st.subheader("Meeko")
         if meeko_available:
             st.success(meeko_detail)
-            st.caption("支持 `PDB/PQR -> receptor.pdbqt` 和 `SDF/MOL2/MOL -> ligand.pdbqt`。")
+            st.caption("支持 `PDB/PQR -> receptor.pdbqt`、`SDF/MOL2/MOL -> ligand.pdbqt`，以及 `CSV(SMILES) -> ligand.pdbqt`。")
         else:
             st.warning(f"Meeko 不可用：{meeko_detail}")
             st.caption("安装 `requirements.txt` 后，可直接在界面中准备受体和配体。")
@@ -769,7 +964,7 @@ def show_meeko_ligand_panel(meeko_available: bool) -> tuple[list[StructureInput]
     return prepared_ligands, selected_ligand
 
 
-def show_ligand_panel(meeko_available: bool) -> tuple[list[StructureInput], StructureInput | None]:
+def _legacy_show_ligand_panel(meeko_available: bool) -> tuple[list[StructureInput], StructureInput | None]:
     st.subheader("2. Ligands")
     mode = st.radio(
         "配体输入方式",
@@ -779,6 +974,207 @@ def show_ligand_panel(meeko_available: bool) -> tuple[list[StructureInput], Stru
     )
     if mode == DIRECT_LIGAND_MODE:
         return show_direct_ligand_panel()
+    return show_meeko_ligand_panel(meeko_available)
+
+
+def show_csv_smiles_ligand_panel(meeko_available: bool) -> tuple[list[StructureInput], StructureInput | None]:
+    if not meeko_available:
+        st.warning("当前未检测到 Meeko，无法直接从 CSV SMILES 准备配体。")
+        return [], None
+
+    csv_upload = st.file_uploader(
+        "上传包含候选化合物的 `CSV`",
+        type=["csv"],
+        accept_multiple_files=False,
+        key="csv_smiles_ligand_upload",
+    )
+    if csv_upload is None:
+        st.caption("上传包含 SMILES 列的 CSV 后，可直接将候选化合物转换为 `ligand.pdbqt` 并批量 docking。")
+        return [], None
+
+    try:
+        csv_frame = read_uploaded_csv_table(csv_upload)
+    except Exception as exc:
+        st.error(str(exc))
+        return [], None
+
+    if csv_frame.empty or not list(csv_frame.columns):
+        st.warning("CSV 文件为空，或未读取到任何列。")
+        return [], None
+
+    columns = [str(column) for column in csv_frame.columns]
+    smiles_column = st.selectbox(
+        "SMILES 列",
+        options=columns,
+        index=max(0, columns.index(choose_preferred_column(columns, ("smiles", "smile", "canonical_smiles", "isomeric_smiles")) or columns[0])),
+        key="csv_smiles_column",
+    )
+    name_options = ["(使用行号命名)"] + columns
+    suggested_name_column = choose_preferred_column(
+        columns,
+        ("name", "compound_name", "compound", "molecule", "molecule_name", "ligand", "id", "identifier"),
+    )
+    default_name_option = suggested_name_column if suggested_name_column in columns else "(使用行号命名)"
+    name_column_label = st.selectbox(
+        "名称列（可选）",
+        options=name_options,
+        index=name_options.index(default_name_option),
+        key="csv_name_column",
+    )
+    name_column = None if name_column_label == "(使用行号命名)" else name_column_label
+    charge_model = st.selectbox(
+        "配体电荷模型",
+        options=["gasteiger", "zero"],
+        key="csv_smiles_charge_model",
+        help="SMILES CSV 不包含原子部分电荷，因此这里不提供 `read`。",
+    )
+
+    fallback_stem = Path(csv_upload.name).stem or "csv-ligand"
+    records, skipped_empty = build_smiles_records(
+        csv_frame,
+        smiles_column=smiles_column,
+        name_column=name_column,
+        fallback_stem=fallback_stem,
+    )
+    if not records:
+        st.warning("当前 CSV 中没有可用的 SMILES 记录。")
+        return [], None
+
+    preview_columns: list[str] = []
+    for column in [name_column, smiles_column]:
+        if column and column not in preview_columns:
+            preview_columns.append(column)
+    preview_frame = csv_frame.loc[:, preview_columns].head(10).copy()
+    preview_frame.insert(0, "Row", range(1, len(preview_frame) + 1))
+    st.caption(f"已读取 {len(csv_frame)} 行，检测到 {len(records)} 个候选化合物。")
+    if skipped_empty:
+        st.caption(f"其中跳过了 {skipped_empty} 行空 SMILES。")
+    st.dataframe(preview_frame, use_container_width=True, hide_index=True)
+
+    signature = fingerprint_parts(
+        "csv_smiles",
+        csv_upload.name,
+        csv_upload.getvalue(),
+        smiles_column,
+        name_column or "",
+        charge_model,
+    )
+    sync_signature_state(
+        "prepared_ligands_signature",
+        signature,
+        {
+            "prepared_ligands": [],
+            "prepared_ligand_logs": {},
+            "prepared_ligand_failures": [],
+        },
+    )
+
+    if st.button("用 Meeko 准备 CSV 配体", use_container_width=True, key="prepare_csv_ligands"):
+        try:
+            prepared_files = prepare_smiles_ligands_pdbqt(
+                csv_upload.name,
+                records,
+                charge_model=charge_model,
+            )
+            successes = [
+                StructureInput(
+                    name=prepared_file.name,
+                    data=prepared_file.data,
+                    file_format="pdbqt",
+                    source_label=f"CSV SMILES from {csv_upload.name}",
+                )
+                for prepared_file in prepared_files
+            ]
+            logs = {
+                prepared_file.name: combined_log_text(prepared_file.stdout, prepared_file.stderr)
+                for prepared_file in prepared_files
+            }
+            failures = []
+        except Exception as exc:
+            successes = []
+            logs = {}
+            failures = [{"Ligand": csv_upload.name, "Error": str(exc)}]
+
+        st.session_state["prepared_ligands"] = successes
+        st.session_state["prepared_ligand_logs"] = logs
+        st.session_state["prepared_ligand_failures"] = failures
+
+        if successes:
+            st.success(f"已从 CSV 准备 {len(successes)} 个配体。")
+        if failures:
+            st.warning(f"CSV 配体准备失败：{failures[0]['Error']}")
+
+    prepared_ligands = stored_structure_list("prepared_ligands")
+    ligand_failures = st.session_state.get("prepared_ligand_failures", [])
+    ligand_logs = st.session_state.get("prepared_ligand_logs", {})
+    if not isinstance(ligand_logs, dict):
+        ligand_logs = {}
+
+    if not prepared_ligands:
+        return [], None
+
+    if len(prepared_ligands) > 1:
+        st.info(f"当前有 {len(prepared_ligands)} 个已准备好的 CSV 配体，将按顺序执行批量 docking。")
+    else:
+        st.caption("当前是单任务 docking。")
+
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {
+                    "Ligand": ligand.name,
+                    "Source": ligand.source_label,
+                    "Size (bytes)": len(ligand.data),
+                }
+                for ligand in prepared_ligands
+            ]
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    preview_index = st.selectbox(
+        "预览已准备好的 CSV 配体",
+        options=list(range(len(prepared_ligands))),
+        format_func=lambda index: prepared_ligands[index].name,
+        key="prepared_csv_ligand_preview_index",
+    )
+    selected_ligand = prepared_ligands[preview_index]
+
+    with st.expander("下载已准备好的 CSV 配体"):
+        for ligand in prepared_ligands:
+            st.download_button(
+                f"下载 {ligand.name}",
+                data=ligand.data,
+                file_name=ligand.name,
+                use_container_width=True,
+                key=f"download_prepared_csv_ligand_{ligand.name}",
+            )
+
+    log_text = str(ligand_logs.get(selected_ligand.name, ""))
+    if log_text:
+        with st.expander(f"查看 {selected_ligand.name} 的 CSV/Meeko 日志"):
+            st.text(log_text)
+
+    if ligand_failures:
+        with st.expander("查看 CSV 配体准备失败记录"):
+            st.dataframe(pd.DataFrame(ligand_failures), use_container_width=True, hide_index=True)
+
+    return prepared_ligands, selected_ligand
+
+
+def show_ligand_panel(meeko_available: bool) -> tuple[list[StructureInput], StructureInput | None]:
+    st.subheader("2. Ligands")
+    mode = st.radio(
+        "配体输入方式",
+        options=[DIRECT_LIGAND_MODE, MEEKO_LIGAND_MODE, CSV_SMILES_LIGAND_MODE],
+        horizontal=True,
+        key="ligand_input_mode",
+    )
+    if mode == DIRECT_LIGAND_MODE:
+        return show_direct_ligand_panel()
+    if mode == CSV_SMILES_LIGAND_MODE:
+        return show_csv_smiles_ligand_panel(meeko_available)
     return show_meeko_ligand_panel(meeko_available)
 
 
@@ -825,7 +1221,7 @@ def show_box_panel(uploaded_ligand_text: str | None, reference_ligand_pdb: str |
     return current_box()
 
 
-def show_options_panel(backend: DockingBackendConfig) -> tuple[int, int, float, int, int | None]:
+def _legacy_show_options_panel(backend: DockingBackendConfig) -> tuple[int, int, float, int, int | None]:
     st.subheader("4. Docking Options")
     if backend.kind != "vina_cpu":
         st.info("当前使用 GPU 后端。该模式主要读取侧边栏中的 `GPU Thread`、`Search Depth`，以及这里的输出控制参数。")
@@ -1108,6 +1504,243 @@ def render_history_panel(runs_dir: Path) -> None:
         return
 
     render_run_details(selected_run, context_key="history")
+
+
+def show_environment_panel() -> tuple[DockingBackendConfig, Path, bool]:
+    meeko_available, meeko_detail = probe_meeko()
+    with st.sidebar:
+        st.header("运行环境")
+        config_file = st.file_uploader(
+            "导入可选配置文件",
+            type=["conf", "txt"],
+            key="optional_config_upload",
+            help="支持导入 vina / vina-gpu 风格的 `key = value` 配置；受体、配体和输出路径会被忽略。",
+        )
+        if st.button("应用配置文件", use_container_width=True):
+            st.session_state["config_import_message"] = ""
+            st.session_state["config_import_error"] = ""
+
+            if config_file is None:
+                st.session_state["config_import_error"] = "请先选择一个配置文件。"
+                st.rerun()
+
+            decoded_text = None
+            last_error: Exception | None = None
+            payload = config_file.getvalue()
+            for encoding in ("utf-8-sig", "utf-8", "gb18030"):
+                try:
+                    decoded_text = payload.decode(encoding)
+                    break
+                except UnicodeDecodeError as exc:
+                    last_error = exc
+
+            if decoded_text is None:
+                st.session_state["config_import_error"] = f"配置文件解码失败：{last_error}"
+                st.rerun()
+
+            try:
+                config_values = parse_optional_config_text(decoded_text)
+                applied = apply_optional_config(config_values)
+            except Exception as exc:
+                st.session_state["config_import_error"] = f"配置导入失败：{exc}"
+                st.rerun()
+
+            if not config_values:
+                st.session_state["config_import_error"] = "配置文件中没有找到可读取的 `key = value` 项。"
+            elif not applied:
+                st.session_state["config_import_error"] = "配置文件已读取，但没有识别到可导入的参数。"
+            else:
+                st.session_state["config_import_message"] = f"已导入参数：{', '.join(applied)}"
+            st.rerun()
+
+        if st.session_state["config_import_message"]:
+            st.success(st.session_state["config_import_message"])
+        if st.session_state["config_import_error"]:
+            st.warning(st.session_state["config_import_error"])
+
+        backend_label = st.selectbox(
+            "Docking 后端",
+            options=[CPU_BACKEND, GPU_BACKEND],
+            key="backend_label",
+            help="全部在本机执行；选择 GPU 时不会接入云服务器。",
+        )
+
+        if backend_label == CPU_BACKEND:
+            executable = st.text_input(
+                "Vina 可执行文件",
+                value=str(st.session_state["vina_executable"]),
+                key="vina_executable",
+                help="可填写 `vina`、`vina.exe`，或绝对路径。",
+            )
+            backend = DockingBackendConfig(kind="vina_cpu", executable=executable)
+        else:
+            executable = st.text_input(
+                "Vina-GPU 可执行文件",
+                value=str(st.session_state["vina_gpu_executable"]),
+                key="vina_gpu_executable",
+                help="填写本地 `vina_gpu.exe` 或 `Vina-GPU.exe` 的完整路径。",
+            )
+            kernel_executable = st.text_input(
+                "Vina-GPU-K 可执行文件",
+                value=str(st.session_state["vina_gpu_kernel_executable"]),
+                key="vina_gpu_kernel_executable",
+                help="首次运行或缺少 `Kernel2_Opt.bin` 时，会自动使用 `vina_gpu_k.exe`。",
+            )
+            thread = int(
+                st.number_input(
+                    "GPU Thread",
+                    min_value=1,
+                    value=int(st.session_state["vina_gpu_thread"]),
+                    step=100,
+                    key="vina_gpu_thread",
+                    help="官方 README 默认值是 `1000`，一般建议小于 `10000`。",
+                )
+            )
+            search_depth_raw = st.text_input(
+                "Search Depth",
+                value=str(st.session_state["vina_gpu_search_depth"]),
+                key="vina_gpu_search_depth",
+                help="留空则交给官方 `Vina-GPU` 自动决定。",
+            )
+            try:
+                search_depth = parse_optional_int(search_depth_raw)
+            except ValueError:
+                search_depth = None
+                st.warning("`Search Depth` 必须是整数，当前将忽略该值。")
+            backend = DockingBackendConfig(
+                kind="vina_gpu_official",
+                executable=executable,
+                kernel_executable=kernel_executable,
+                thread=thread,
+                search_depth=search_depth,
+            )
+
+        runs_dir_raw = st.text_input(
+            "结果目录",
+            value=str(st.session_state["runs_dir"]),
+            key="runs_dir",
+            help="每个单体或批量任务都会创建独立运行目录。",
+        )
+        runs_dir = Path(runs_dir_raw).expanduser()
+
+        if st.button("检查当前后端", use_container_width=True):
+            try:
+                resolved = resolve_backend_executable(backend)
+                st.success(f"已找到：{resolved}")
+                if backend.kind == "vina_gpu_official":
+                    kernel_dir = Path(resolved).resolve().parent
+                    kernel_bin = kernel_dir / "Kernel2_Opt.bin"
+                    st.caption(f"官方 Vina-GPU 目录：{kernel_dir}")
+                    if kernel_bin.exists():
+                        st.caption(f"已检测到 `{kernel_bin.name}`，将优先运行 `vina_gpu.exe`。")
+                    else:
+                        st.caption("未检测到 `Kernel2_Opt.bin`，程序会自动切到 `vina_gpu_k.exe`。")
+            except Exception as exc:
+                st.error(str(exc))
+
+        st.markdown("---")
+        st.subheader("Meeko")
+        if meeko_available:
+            st.success(meeko_detail)
+            st.caption("支持 `PDB/PQR -> receptor.pdbqt` 和 `SDF/MOL2/MOL -> ligand.pdbqt`。")
+        else:
+            st.warning(f"Meeko 不可用：{meeko_detail}")
+            st.caption("安装 `requirements.txt` 后，可直接在界面中准备受体和配体。")
+
+        st.markdown("---")
+        if backend.kind == "vina_gpu_official":
+            st.caption("当前使用本地官方 `Vina-GPU` 执行 docking，不需要云服务器。")
+        else:
+            st.caption("当前使用本地 `AutoDock Vina` CPU 后端。")
+        st.caption("PDB ID helper 会从 RCSB 下载结构并做受体清洗。")
+    return backend, runs_dir, meeko_available
+
+
+def show_options_panel(backend: DockingBackendConfig) -> tuple[int, int, float, int, int | None]:
+    st.subheader("4. Docking Options")
+    if backend.kind != "vina_cpu":
+        st.info("当前使用 GPU 后端。该模式主要读取侧边栏中的 `GPU Thread`、`Search Depth`，以及这里的输出控制参数。")
+        col1, col2 = st.columns(2)
+        with col1:
+            num_modes = st.number_input(
+                "Num Modes",
+                min_value=1,
+                value=int(st.session_state["gpu_num_modes"]),
+                step=1,
+                key="gpu_num_modes",
+            )
+        with col2:
+            energy_range = st.number_input(
+                "Energy Range",
+                min_value=0.5,
+                value=float(st.session_state["gpu_energy_range"]),
+                step=0.5,
+                format="%.1f",
+                key="gpu_energy_range",
+            )
+        seed_raw = st.text_input(
+            "Random Seed",
+            value=str(st.session_state["gpu_seed"]),
+            help="留空则由官方 `Vina-GPU` 自动生成。",
+            key="gpu_seed",
+        )
+        seed = None
+        if seed_raw.strip():
+            try:
+                seed = int(seed_raw)
+            except ValueError:
+                st.warning("Random Seed 必须是整数，当前将忽略该值。")
+        return 8, int(num_modes), float(energy_range), 0, seed
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        exhaustiveness = st.number_input(
+            "Exhaustiveness",
+            min_value=1,
+            value=int(st.session_state["cpu_exhaustiveness"]),
+            step=1,
+            key="cpu_exhaustiveness",
+        )
+    with col2:
+        num_modes = st.number_input(
+            "Num Modes",
+            min_value=1,
+            value=int(st.session_state["cpu_num_modes"]),
+            step=1,
+            key="cpu_num_modes",
+        )
+    with col3:
+        energy_range = st.number_input(
+            "Energy Range",
+            min_value=0.5,
+            value=float(st.session_state["cpu_energy_range"]),
+            step=0.5,
+            format="%.1f",
+            key="cpu_energy_range",
+        )
+    with col4:
+        cpu = st.number_input(
+            "CPU",
+            min_value=0,
+            value=int(st.session_state["cpu_threads"]),
+            step=1,
+            help="0 表示交给 Vina 自动决定。",
+            key="cpu_threads",
+        )
+
+    seed_raw = st.text_input(
+        "Random Seed",
+        value=str(st.session_state["cpu_seed"]),
+        help="留空则由 Vina 自动生成。",
+        key="cpu_seed",
+    )
+    seed = None
+    if seed_raw.strip():
+        try:
+            seed = int(seed_raw)
+        except ValueError:
+            st.warning("Random Seed 必须是整数，当前将忽略该值。")
+    return int(exhaustiveness), int(num_modes), float(energy_range), int(cpu), seed
 
 
 def main() -> None:
